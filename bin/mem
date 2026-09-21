@@ -1,0 +1,353 @@
+#!/usr/bin/env bash
+# mem — tiny POSIX-shell helper for the claude-memory-kit tree.
+# Works everywhere bash + coreutils + jq are available. Zero runtime deps
+# beyond that. Use from any terminal (cmux, tmux, SSH, plain iTerm) when
+# you don't have an agent handy.
+#
+# Commands:
+#   mem restore [--project SLUG] [--concise]  # print "where you left off"
+#   mem checkpoint [--project SLUG] [--mode concise|exhaustive|raw] [--topic TOPIC]
+#       (reads the checkpoint body from stdin)
+#   mem commit --scope SLUG|global --slug NAME
+#       (reads reference-doc body from stdin)
+#   mem list [--project SLUG]                 # list checkpoints
+#   mem tree                                  # print the memory tree
+#   mem where                                 # print the resolved memory root
+#   mem project                               # print the resolved active project
+#   mem help
+#
+# Environment:
+#   CLAUDE_MEMORY_ROOT   overrides the tree location (default ~/claude-memory)
+#   CLAUDE_PROJECT       fallback active project (used when no .claude-project)
+
+set -euo pipefail
+
+resolve_root() {
+  if [[ -n "${CLAUDE_MEMORY_ROOT:-}" && -d "$CLAUDE_MEMORY_ROOT" ]]; then
+    echo "$CLAUDE_MEMORY_ROOT"; return
+  fi
+  if [[ -d "$HOME/claude-memory" ]]; then echo "$HOME/claude-memory"; return; fi
+  if [[ -d "$HOME/Documents/claude-memory" ]]; then echo "$HOME/Documents/claude-memory"; return; fi
+  echo "$HOME/claude-memory"  # will fail loudly on first use
+}
+
+resolve_project() {
+  local d="$PWD"
+  while [[ "$d" != "/" && "$d" != "$HOME" ]]; do
+    if [[ -f "$d/.claude-project" ]]; then
+      tr -d '[:space:]' < "$d/.claude-project"; return
+    fi
+    d="$(dirname "$d")"
+  done
+  if [[ -n "${CLAUDE_PROJECT:-}" ]]; then echo "$CLAUDE_PROJECT"; return; fi
+  d="$PWD"
+  while [[ "$d" != "/" && "$d" != "$HOME" ]]; do
+    for f in CLAUDE.md AGENTS.md; do
+      if [[ -f "$d/$f" ]]; then
+        local slug
+        slug="$(grep -m1 '^MEMORY_PROJECT:' "$d/$f" 2>/dev/null | sed 's/^MEMORY_PROJECT:[[:space:]]*//' | tr -d '[:space:]' || true)"
+        [[ -n "$slug" ]] && { echo "$slug"; return; }
+      fi
+    done
+    d="$(dirname "$d")"
+  done
+  echo "global"
+}
+
+MEMORY_ROOT="$(resolve_root)"
+
+cmd_where() { echo "$MEMORY_ROOT"; }
+
+cmd_project() {
+  local slug="${1:-}"
+  [[ -z "$slug" ]] && slug="$(resolve_project)"
+  echo "$slug"
+}
+
+cmd_tree() {
+  if command -v tree >/dev/null 2>&1; then
+    tree -L 3 "$MEMORY_ROOT"
+  else
+    find "$MEMORY_ROOT" -maxdepth 3 -print
+  fi
+}
+
+cmd_list() {
+  local slug="${1:-$(resolve_project)}"
+  local dir
+  if [[ "$slug" == "global" ]]; then
+    dir="$MEMORY_ROOT/checkpoints"
+  else
+    dir="$MEMORY_ROOT/projects/$slug/checkpoints"
+  fi
+  if [[ ! -d "$dir" ]]; then
+    echo "No checkpoints yet for '$slug' at $dir"
+    return
+  fi
+  echo "Checkpoints in $dir (newest first):"
+  ls -1 "$dir"/*.json 2>/dev/null | sort -r | while read -r f; do
+    printf "  %s\n" "$(basename "$f" .json)"
+    if command -v jq >/dev/null 2>&1; then
+      jq -r '"    tldr: \(.tldr)\n    next: \(.next_action)"' "$f" 2>/dev/null || true
+    fi
+  done
+}
+
+cmd_restore() {
+  local slug="${1:-$(resolve_project)}"
+  local concise="${2:-0}"
+
+  echo "## Where you left off — ${slug}"
+  echo
+  echo "**Memory root:** $MEMORY_ROOT"
+  echo "**Detected project:** $slug"
+  echo
+
+  local ckpt_dir
+  if [[ "$slug" == "global" ]]; then
+    ckpt_dir="$MEMORY_ROOT/checkpoints"
+  else
+    ckpt_dir="$MEMORY_ROOT/projects/$slug/checkpoints"
+  fi
+
+  local latest
+  latest="$(ls -1 "$ckpt_dir"/*.json 2>/dev/null | sort -r | head -n1 || true)"
+  if [[ -z "$latest" ]]; then
+    echo "(no checkpoints yet — clean slate)"
+    return
+  fi
+
+  if command -v jq >/dev/null 2>&1; then
+    local topic created next tldr mode
+    topic="$(jq -r .topic "$latest")"
+    created="$(jq -r .created "$latest")"
+    next="$(jq -r .next_action "$latest")"
+    tldr="$(jq -r .tldr "$latest")"
+    mode="$(jq -r .mode "$latest")"
+    echo "**Last checkpoint:** $topic ($created) [$mode]"
+    echo "**→ Next:** $next"
+    echo
+    echo "### TL;DR"
+    echo "$tldr"
+  else
+    echo "**Last checkpoint file:** $(basename "$latest")"
+    echo "(install jq for a richer summary)"
+  fi
+
+  echo
+  echo "### Checkpoint history"
+  ls -1 "$ckpt_dir"/*.json 2>/dev/null | sort -r | while read -r f; do
+    if command -v jq >/dev/null 2>&1; then
+      printf -- "- %s — %s\n" "$(basename "$f" .json)" "$(jq -r .tldr "$f")"
+    else
+      printf -- "- %s\n" "$(basename "$f" .json)"
+    fi
+  done
+
+  if [[ "$concise" != "1" ]]; then
+    echo
+    echo "### Global MEMORY.md"
+    [[ -f "$MEMORY_ROOT/MEMORY.md" ]] && cat "$MEMORY_ROOT/MEMORY.md" || echo "(missing)"
+    if [[ "$slug" != "global" ]]; then
+      local proj_mem="$MEMORY_ROOT/projects/$slug/MEMORY.md"
+      echo
+      echo "### Project MEMORY.md ($slug)"
+      [[ -f "$proj_mem" ]] && cat "$proj_mem" || echo "(missing)"
+    fi
+  fi
+}
+
+cmd_checkpoint() {
+  local slug="$1" mode="$2" topic="$3"
+  local ts="$(date '+%Y-%m-%d-%H%M%S')"
+  local iso="$(date '+%Y-%m-%dT%H:%M:%S%z')"
+  local ckpt_dir mem_index
+  if [[ "$slug" == "global" ]]; then
+    ckpt_dir="$MEMORY_ROOT/checkpoints"
+    mem_index="$MEMORY_ROOT/MEMORY.md"
+  else
+    ckpt_dir="$MEMORY_ROOT/projects/$slug/checkpoints"
+    mem_index="$MEMORY_ROOT/projects/$slug/MEMORY.md"
+    mkdir -p "$MEMORY_ROOT/projects/$slug"
+  fi
+  mkdir -p "$ckpt_dir"
+
+  local base="$ts-$topic"
+  local n=1
+  while [[ -e "$ckpt_dir/$base.md" ]]; do
+    n=$((n+1)); base="$ts-$topic-$n"
+  done
+
+  local body_file="$ckpt_dir/$base.md"
+  local json_file="$ckpt_dir/$base.json"
+
+  local body
+  body="$(cat)"
+
+  local next_action tldr
+  next_action="$(printf '%s\n' "$body" | grep -m1 -Ei '^(next_action|next|→ next):' | sed -E 's/^[^:]+:[[:space:]]*//' || true)"
+  [[ -z "$next_action" ]] && next_action="(not specified)"
+  tldr="$(printf '%s\n' "$body" | grep -m1 -Ei '^tldr:|^## TL;DR' | sed -E 's/^[^:#]+[:#][[:space:]]*//' || true)"
+  [[ -z "$tldr" ]] && tldr="$(printf '%s\n' "$body" | head -n1)"
+
+  {
+    echo "---"
+    echo "project: $slug"
+    echo "topic: $topic"
+    echo "created: $iso"
+    echo "mode: $mode"
+    echo "status: complete"
+    echo "next_action: $next_action"
+    echo "---"
+    echo
+    printf '%s\n' "$body"
+  } > "$body_file"
+
+  if command -v jq >/dev/null 2>&1; then
+    jq -n \
+      --arg project "$slug" --arg topic "$topic" --arg created "$iso" \
+      --arg mode "$mode" --arg tldr "$tldr" --arg next "$next_action" \
+      --arg fn "$base.md" \
+      '{project:$project, topic:$topic, created:$created, mode:$mode, status:"complete",
+        tldr:$tldr, next_action:$next, filename:$fn}' > "$json_file"
+  else
+    cat > "$json_file" <<EOF
+{"project":"$slug","topic":"$topic","created":"$iso","mode":"$mode","status":"complete",
+ "tldr":"$(printf '%s' "$tldr" | sed 's/"/\\"/g')",
+ "next_action":"$(printf '%s' "$next_action" | sed 's/"/\\"/g')","filename":"$base.md"}
+EOF
+  fi
+
+  if [[ ! -f "$mem_index" ]]; then
+    cat > "$mem_index" <<EOF
+---
+title: $slug
+description: Memory index
+updated: $(date '+%Y-%m-%d')
+---
+
+# $slug
+
+## Checkpoints
+EOF
+  fi
+  local line="- [$ts — $topic](checkpoints/$base.md) — [$mode] $tldr"
+  awk -v ln="$line" '
+    { print }
+    /^## Checkpoints[[:space:]]*$/ && !ins { print ""; print ln; ins=1 }
+  ' "$mem_index" > "$mem_index.tmp" && mv "$mem_index.tmp" "$mem_index"
+
+  echo "✓ Checkpoint saved [$mode]"
+  echo "  Project:   $slug"
+  echo "  Body:      $body_file"
+  echo "  Sidecar:   $json_file"
+  echo "  Indexed:   $mem_index"
+  echo "  Next:      $next_action"
+}
+
+cmd_commit() {
+  local scope="$1" slug="$2"
+  local ref_dir mem_index
+  if [[ "$scope" == "global" ]]; then
+    ref_dir="$MEMORY_ROOT/reference"
+    mem_index="$MEMORY_ROOT/MEMORY.md"
+  else
+    ref_dir="$MEMORY_ROOT/projects/$scope/reference"
+    mem_index="$MEMORY_ROOT/projects/$scope/MEMORY.md"
+    mkdir -p "$MEMORY_ROOT/projects/$scope"
+  fi
+  mkdir -p "$ref_dir"
+
+  local target="$ref_dir/$slug.md"
+  local n=1
+  while [[ -e "$target" ]]; do
+    n=$((n+1)); target="$ref_dir/$slug-$n.md"
+  done
+
+  cat > "$target"
+  echo "✓ Committed: $target"
+
+  if [[ -f "$mem_index" ]] && ! grep -q "reference/$slug.md" "$mem_index"; then
+    echo "" >> "$mem_index"
+    echo "- [$slug](reference/$(basename "$target")) — committed $(date '+%Y-%m-%d')" >> "$mem_index"
+    echo "  Indexed: $mem_index"
+  fi
+}
+
+cmd_help() {
+  cat <<'EOF'
+mem — claude-memory-kit CLI helper
+
+Commands:
+  mem restore [--project SLUG] [--concise]
+  mem checkpoint [--project SLUG] [--mode MODE] [--topic TOPIC]     (body on stdin)
+  mem commit --scope SLUG|global --slug NAME                        (body on stdin)
+  mem list [--project SLUG]
+  mem tree
+  mem where
+  mem project [SLUG]
+  mem help
+
+Environment:
+  CLAUDE_MEMORY_ROOT   overrides the tree location (default ~/claude-memory)
+  CLAUDE_PROJECT       fallback active project
+
+Example:
+  mem restore
+  echo "TL;DR: fixed the deploy. Next: monitor for 24h." | mem checkpoint --mode concise --topic fix-deploy
+EOF
+}
+
+sub="${1:-help}"; shift || true
+
+case "$sub" in
+  where|w)     cmd_where "$@" ;;
+  project|p)   cmd_project "$@" ;;
+  tree|t)      cmd_tree "$@" ;;
+  help|-h|--help) cmd_help ;;
+
+  list|ls)
+    slug=""
+    while [[ $# -gt 0 ]]; do
+      case "$1" in --project) slug="$2"; shift 2 ;; *) shift ;; esac
+    done
+    cmd_list "$slug" ;;
+
+  restore|r)
+    slug=""; concise=0
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --project) slug="$2"; shift 2 ;;
+        --concise) concise=1; shift ;;
+        *) shift ;;
+      esac
+    done
+    cmd_restore "$slug" "$concise" ;;
+
+  checkpoint|c)
+    slug=""; mode="exhaustive"; topic="session"
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --project) slug="$2"; shift 2 ;;
+        --mode) mode="$2"; shift 2 ;;
+        --topic) topic="$2"; shift 2 ;;
+        *) shift ;;
+      esac
+    done
+    [[ -z "$slug" ]] && slug="$(resolve_project)"
+    cmd_checkpoint "$slug" "$mode" "$topic" ;;
+
+  commit)
+    scope="global"; slug=""
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --scope) scope="$2"; shift 2 ;;
+        --slug)  slug="$2";  shift 2 ;;
+        *) shift ;;
+      esac
+    done
+    [[ -z "$slug" ]] && { echo "mem commit: --slug NAME is required" >&2; exit 2; }
+    cmd_commit "$scope" "$slug" ;;
+
+  *) echo "Unknown command: $sub" >&2; cmd_help; exit 2 ;;
+esac
