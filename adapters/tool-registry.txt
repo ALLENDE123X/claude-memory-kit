@@ -1,0 +1,41 @@
+# tool-registry.txt
+# One line per agent-tool destination. Format:
+#   <destination path>|<style>
+# Styles:
+#   skill-folder   -> writes <dest>/<skill>/SKILL.md   (Claude Code, Antigravity)
+#   flat-md        -> writes <dest>/<skill>.md         (Codex, opencode, Gemini, Aider)
+#   cursor-rules   -> writes <dest>/<skill>.mdc        (Cursor .cursor/rules)
+#   windsurf-rules -> writes one combined file         (Windsurf)
+#
+# The installer copies to every path listed, whether or not that tool is
+# currently installed — an unused directory does no harm and means when you
+# do install that tool later, the skills are already there.
+
+# --- Claude ---------------------------------------------------------------
+~/.claude/skills                          | skill-folder
+
+# --- Cursor ---------------------------------------------------------------
+~/.cursor/skills                          | skill-folder
+~/.cursor/rules                           | cursor-rules
+
+# --- Codex CLI ------------------------------------------------------------
+~/.codex/prompts                          | flat-md
+
+# --- Antigravity ----------------------------------------------------------
+~/.antigravity/skills                     | skill-folder
+~/.antigravity/prompts                    | flat-md
+
+# --- opencode -------------------------------------------------------------
+~/.config/opencode/prompts                | flat-md
+
+# --- Gemini CLI -----------------------------------------------------------
+~/.gemini/prompts                         | flat-md
+
+# --- Aider ----------------------------------------------------------------
+~/.aider.conf.d/prompts                   | flat-md
+
+# --- Windsurf -------------------------------------------------------------
+~/.windsurf/rules                         | windsurf-rules
+
+# --- cmux / generic terminals ---------------------------------------------
+# The mem CLI in ~/.local/bin/mem is how these use the tree; no skill dir.
